@@ -62,7 +62,8 @@ function claudeEntrypointIsNonInteractive(entrypoint) {
  * explicit `transcript.interaction` is trusted when it is already one of the two labels.
  */
 export function classifyInteraction(transcript) {
-  if (transcript?.parentSessionId || (transcript?.harness === "pi" && signalsOf(transcript).source === "subagent")) {
+  // Ancestry alone (`parentSessionId`) is not automation: a Pi `/fork` has a parent too.
+  if (transcript?.harness === "pi" && signalsOf(transcript).source === "subagent") {
     return NON_INTERACTIVE;
   }
   const stamped = transcript?.interaction;

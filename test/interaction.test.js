@@ -1103,62 +1103,91 @@ test("standalone fold refreshes stale OMP interaction categories with unreadable
   }
 });
 
-test("flat Pi children share their lead's observer and reclassify a pre-relation cache", async () => {
-  const repo = initRepo();
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-discovery-"));
-  const sessionRoot = path.join(home, ".pi", "agent", "sessions", "-repo-demo");
-  const leadPath = path.join(sessionRoot, "lead.jsonl");
-  const childPath = path.join(sessionRoot, "child.jsonl");
-  const header = (id, extra = {}) => [
-    { type: "session", version: 3, id, timestamp: "2026-08-27T00:00:00.000Z", cwd: repo, ...extra },
-  ];
-  writeJsonl(leadPath, header("lead-native"));
-  writeJsonl(childPath, header("child-native", { parentSession: leadPath }));
-
-  const envKeys = [
+async function withPiEnv(env, fn) {
+  const keys = [
     "HOME",
     "PI_CODING_AGENT_DIR",
     "PI_CODING_AGENT_SESSION_DIR",
     "BB_DATA_DIR",
     "BB_PI_BRIDGE_SESSION_DIR",
   ];
-  const prevEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
-  for (const key of envKeys) delete process.env[key];
-  process.env.HOME = home;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  for (const key of keys) delete process.env[key];
+  Object.assign(process.env, env);
   try {
+    return await fn();
+  } finally {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+const piHeader = (id, cwd, extra = {}) => [
+  { type: "session", version: 3, id, timestamp: "2026-08-27T00:00:00.000Z", cwd, ...extra },
+];
+
+test("a header-linked Pi fork stays interactive, shares its lead's observer, and reclassifies old cache", async () => {
+  const repo = initRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-discovery-"));
+  const sessionRoot = path.join(home, ".pi", "agent", "sessions", "-repo-demo");
+  const leadPath = path.join(sessionRoot, "lead.jsonl");
+  writeJsonl(leadPath, piHeader("lead-native", repo));
+  writeJsonl(path.join(sessionRoot, "fork.jsonl"), piHeader("fork-native", repo, { parentSession: leadPath }));
+
+  await withPiEnv({ HOME: home }, async () => {
     const config = loadConfig(repo, { discovery: { harnesses: ["pi"], since: "all" } });
     config.state = new State(repo).ensure();
-    // A cache written before parentSession was read: the child looks like its own interactive observer.
+    // A cache written before parentSession was read: the fork looks like its own observer.
     const cache = config.state.readScanCache();
     for (const candidate of pi.enumerate({ config })) {
       const descriptor = pi.classify(candidate);
       delete descriptor.parentSessionId;
       delete descriptor.parentSessionPath;
       delete descriptor.parentSessionStartedAt;
-      descriptor.interactionSignals = {};
       cache.entries[`pi:${candidate.key}`] = { mtimeMs: candidate.mtimeMs, bytes: candidate.bytes, descriptor };
     }
     config.state.writeScanCache(cache);
 
     const repository = { name: "demo", root: repo, worktrees: [repo], remotes: [] };
     const first = await discoverTranscripts({ repo: repository, config });
-    assert.equal(first.perHarness.pi.cached, 1, "only the child must be reclassified");
+    assert.equal(first.perHarness.pi.cached, 1, "only the fork must be reclassified");
     const lead = first.transcripts.find((transcript) => transcript.nativeId === "lead-native");
-    const child = first.transcripts.find((transcript) => transcript.nativeId === "child-native");
-    assert.ok(lead && child);
-    assert.notEqual(lead.identity, child.identity);
-    assert.equal(child.corroborationIdentity, lead.identity);
+    const fork = first.transcripts.find((transcript) => transcript.nativeId === "fork-native");
+    assert.ok(lead && fork);
+    assert.notEqual(lead.identity, fork.identity);
+    assert.equal(fork.corroborationIdentity, lead.identity);
     assert.equal(lead.interaction, INTERACTIVE);
-    assert.equal(child.interaction, NON_INTERACTIVE);
+    assert.equal(fork.interaction, INTERACTIVE, "parentSession is also written by a human /fork");
 
     const second = await discoverTranscripts({ repo: repository, config });
     assert.equal(second.perHarness.pi.cached, 2);
-  } finally {
-    for (const [key, value] of Object.entries(prevEnv)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
+  });
+});
+
+test("a Pi child naming its lead by real path shares the lead's observer through a symlinked store", async () => {
+  const repo = initRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-symlink-"));
+  const realStore = path.join(home, "store-real");
+  const linkStore = path.join(home, "store-link");
+  fs.mkdirSync(realStore);
+  fs.symlinkSync(realStore, linkStore);
+  const leadRealPath = path.join(fs.realpathSync(realStore), "lead.jsonl");
+  writeJsonl(leadRealPath, piHeader("lead-native", repo));
+  writeJsonl(path.join(realStore, "child.jsonl"), piHeader("child-native", repo, { parentSession: leadRealPath }));
+
+  await withPiEnv({ HOME: home, PI_CODING_AGENT_SESSION_DIR: linkStore }, async () => {
+    const config = loadConfig(repo, { discovery: { harnesses: ["pi"], since: "all" } });
+    config.state = new State(repo).ensure();
+    const repository = { name: "demo", root: repo, worktrees: [repo], remotes: [] };
+    const { transcripts } = await discoverTranscripts({ repo: repository, config });
+    const lead = transcripts.find((transcript) => transcript.nativeId === "lead-native");
+    const child = transcripts.find((transcript) => transcript.nativeId === "child-native");
+    assert.ok(lead && child);
+    assert.equal(lead.path, path.join(linkStore, "lead.jsonl"), "discovered identities keep the store's spelling");
+    assert.equal(child.corroborationIdentity, lead.identity);
+  });
 });
 
 test("nested OMP subagents share the root identity once the root session appears", async () => {

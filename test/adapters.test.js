@@ -160,7 +160,7 @@ test("pi adapter links a header-linked Pi child to its parent session", () => {
   const file = path.join(FIXTURES, "pi-child-session.jsonl");
   const child = pi.classify(candidateFor(file));
   assert.equal(child.id, "pi-child-5678");
-  assert.equal(child.interactionSignals.source, "subagent");
+  assert.deepEqual(child.interactionSignals, {}, "a header link is ancestry, not automation");
   assert.equal(child.parentSessionId, "pi-1234");
   assert.equal(child.parentSessionPath, path.join(FIXTURES, "pi-session.jsonl"));
   assert.equal(child.parentSessionStartedAt, Date.parse("2026-08-03T08:00:00.000Z"));
@@ -169,42 +169,54 @@ test("pi adapter links a header-linked Pi child to its parent session", () => {
   assert.equal(pi.cacheDependency(candidateFor(path.join(FIXTURES, "pi-session.jsonl"))), undefined);
 });
 
-test("pi adapter walks header-linked children to the highest readable ancestor and stops on cycles", () => {
+function writeLinkedPiSession(dir, name, extra = {}) {
+  const file = path.join(dir, `${name}.jsonl`);
+  fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: 3, id: name, cwd: "/repo/demo", ...extra })}\n`);
+  return file;
+}
+
+test("pi adapter walks header-linked children to the highest readable ancestor", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-chain-"));
-  const write = (name, extra) => {
-    const file = path.join(dir, `${name}.jsonl`);
-    fs.writeFileSync(
-      file,
-      `${JSON.stringify({ type: "session", version: 3, id: name, cwd: "/repo/demo", ...extra })}\n`,
-    );
-    return file;
-  };
-  const lead = write("lead", { timestamp: "2026-08-27T00:00:00.000Z" });
-  const child = write("child", { parentSession: lead });
-  const grandchild = write("grandchild", { parentSession: child });
+  const lead = writeLinkedPiSession(dir, "lead", { timestamp: "2026-08-27T00:00:00.000Z" });
+  const child = writeLinkedPiSession(dir, "child", { parentSession: lead });
+  const grandchild = writeLinkedPiSession(dir, "grandchild", { parentSession: child });
   const descriptor = pi.classify(candidateFor(grandchild));
   assert.equal(descriptor.parentSessionId, "lead");
   assert.equal(descriptor.parentSessionPath, lead);
-
-  const a = path.join(dir, "a.jsonl");
-  const b = write("b", { parentSession: a });
-  write("a", { parentSession: b });
-  const cyclic = pi.classify(candidateFor(a));
-  assert.equal(cyclic.parentSessionId, "b", "a cycle ends at the last unvisited ancestor");
-  assert.equal(cyclic.interactionSignals.source, "subagent");
+  assert.equal(descriptor.parentSessionStartedAt, Date.parse("2026-08-27T00:00:00.000Z"));
 });
 
-test("pi adapter keeps a header-linked child with a missing parent non-interactive and fail-soft", () => {
+test("pi adapter gives every member of a parentSession cycle one observer", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-cycle-"));
+  const a = path.join(dir, "a.jsonl");
+  const b = writeLinkedPiSession(dir, "b", { parentSession: a });
+  writeLinkedPiSession(dir, "a", { parentSession: b });
+  const c = writeLinkedPiSession(dir, "c", { parentSession: b });
+  assert.equal(pi.classify(candidateFor(a)).parentSessionId, undefined, "the smallest path is the cycle's observer");
+  assert.equal(pi.classify(candidateFor(b)).parentSessionId, "a");
+  assert.equal(pi.classify(candidateFor(c)).parentSessionId, "a", "a tail into the cycle shares it too");
+});
+
+test("pi adapter marks a self-linked session's cache entry so old descriptors are reclassified", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-self-"));
+  const self = path.join(dir, "self.jsonl");
+  writeLinkedPiSession(dir, "self", { parentSession: self });
+  assert.notEqual(pi.cacheDependency(candidateFor(self)), undefined);
+  const descriptor = pi.classify(candidateFor(self));
+  assert.equal(descriptor.parentSessionId, undefined);
+  assert.deepEqual(descriptor.interactionSignals, {});
+});
+
+test("pi adapter keeps a header-linked child with a missing parent fail-soft", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-orphan-"));
-  const file = path.join(dir, "orphan.jsonl");
-  const header = { type: "session", version: 3, id: "orphan", cwd: "/repo/demo" };
-  fs.writeFileSync(file, `${JSON.stringify({ ...header, parentSession: path.join(dir, "gone.jsonl") })}\n`);
+  const file = writeLinkedPiSession(dir, "orphan", { parentSession: path.join(dir, "gone.jsonl") });
   const descriptor = pi.classify(candidateFor(file));
   assert.equal(descriptor.id, "orphan");
-  assert.equal(descriptor.interactionSignals.source, "subagent");
+  assert.deepEqual(descriptor.interactionSignals, {});
   assert.equal(descriptor.parentSessionId, undefined);
   assert.equal(descriptor.parentSessionPath, undefined);
   assert.equal(descriptor.parentSessionStartedAt, undefined);
+  assert.notEqual(pi.cacheDependency(candidateFor(file)), undefined, "the parent may appear later");
 });
 
 test("pi adapter ignores an omp-style model field outside a title-led transcript", () => {
