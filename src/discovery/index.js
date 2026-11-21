@@ -78,6 +78,8 @@ export async function discoverTranscripts({
 
   const transcripts = [];
   const identities = new Set();
+  /** Every classified Pi session, in or out of this corpus, for `linkHeaderAncestry`. */
+  const piSessions = [];
   const perHarness = {};
   let cacheDirty = false;
   const hosts = resolveHostList(config);
@@ -117,6 +119,7 @@ export async function discoverTranscripts({
             associateFn,
             stateDir,
             userFilter,
+            piSessions,
             markDirty: () => {
               cacheDirty = true;
             },
@@ -158,11 +161,12 @@ export async function discoverTranscripts({
     remoteMasters.push(...collected.map((result) => result.master).filter(Boolean));
     for (const result of collected) {
       const entry = hosts.find((h) => h.host === result.host);
-      transcripts.push(...remoteTranscripts(result, entry, { scope, repo, config, strict, identities }));
+      transcripts.push(...remoteTranscripts(result, entry, { scope, repo, config, strict, identities, piSessions }));
       perHost.push(hostSummary(result));
     }
   }
 
+  linkHeaderAncestry(transcripts, piSessions);
   const duplicates = dropCrossHostDuplicates(transcripts);
   for (const row of perHost) row.duplicates = duplicates.get(row.host) || 0;
 
@@ -201,7 +205,7 @@ function hostSummary(result) {
  * `--strict`, and the user-scope project filter. The probe already dropped backpass's
  * own sessions on that machine, so none of them ever crossed the wire.
  */
-function remoteTranscripts(result, entry, { scope, repo, config, strict, identities }) {
+function remoteTranscripts(result, entry, { scope, repo, config, strict, identities, piSessions }) {
   if (result.error) return [];
   const associateFn =
     scope?.associateRemote ||
@@ -213,6 +217,7 @@ function remoteTranscripts(result, entry, { scope, repo, config, strict, identit
   for (const descriptor of result.descriptors) {
     const adapter = getAdapter(descriptor.harness);
     if (!adapter) continue;
+    if (descriptor.harness === "pi") piSessions.push(piSession(descriptor, result.host, descriptor));
     const association = associateFn(
       { cwd: descriptor.cwd, remotes: descriptor.remotes || [], gitRoot: descriptor.gitRoot },
       { facts: result.facts, host: result.host, home: result.home || "" },
@@ -243,6 +248,58 @@ function remoteTranscripts(result, entry, { scope, repo, config, strict, identit
   }
   result.matched = out.length;
   return out;
+}
+
+/**
+ * Pi child sessions and `/fork`s name their parent file in the header (`parentSession`,
+ * recorded canonical on its host). Resolve every link once per scan, against every
+ * classified Pi session on every host - including ones outside this corpus - and give
+ * each linked transcript its root ancestor as observer. Links are merged per native id,
+ * so a copy whose parent only exists on another host still inherits that ancestry. A
+ * cycle settles on its smallest native id; an unresolvable link leaves the session its
+ * own observer. Ancestry only: interaction is never derived from it. Runs before the
+ * cross-host dedup, which then reconciles observers of copies as it does for OMP.
+ */
+function piSession(descriptor, host, { key, path }) {
+  const { id, startedAt, parentSession } = descriptor;
+  return { id, startedAt, parentSession, host, key, path };
+}
+
+function linkHeaderAncestry(transcripts, piSessions) {
+  const idByPath = new Map();
+  const sessionByIdHost = new Map();
+  for (const session of piSessions) {
+    idByPath.set(`${session.host || ""}\n${session.key}`, session.id);
+    const idHost = `${session.id}\n${session.host || ""}`;
+    if (!sessionByIdHost.has(idHost)) sessionByIdHost.set(idHost, session);
+    if (!sessionByIdHost.has(session.id)) sessionByIdHost.set(session.id, session);
+  }
+  const parentOf = new Map();
+  for (const session of piSessions) {
+    const parent = session.parentSession && idByPath.get(`${session.host || ""}\n${session.parentSession}`);
+    if (parent && !parentOf.has(session.id)) parentOf.set(session.id, parent);
+  }
+  for (const transcript of transcripts) {
+    if (transcript.harness !== "pi" || transcript.parentSessionId) continue;
+    const chain = [transcript.nativeId];
+    let next = parentOf.get(transcript.nativeId);
+    while (next !== undefined && !chain.includes(next)) {
+      chain.push(next);
+      next = parentOf.get(next);
+    }
+    const root = next === undefined ? chain.at(-1) : chain.slice(chain.indexOf(next)).sort()[0];
+    if (root === transcript.nativeId) continue;
+    const observer = sessionByIdHost.get(`${root}\n${transcript.host || ""}`) || sessionByIdHost.get(root);
+    transcript.parentSessionId = root;
+    transcript.corroborationIdentity = transcriptIdentity({
+      harness: "pi",
+      nativeId: root,
+      path: observer.path,
+      host: observer.host || null,
+    });
+    transcript.corroborationNativeId = root;
+    transcript.corroborationStartedAt = observer.startedAt ?? transcript.startedAt;
+  }
 }
 
 /**
@@ -364,7 +421,7 @@ async function discoverDirect(adapter, { repo, config, cutoffMs, strict, stats, 
 
 function discoverFiles(
   adapter,
-  { repo, config, cutoffMs, strict, stats, cache, markDirty, associateFn, stateDir, userFilter },
+  { repo, config, cutoffMs, strict, stats, cache, markDirty, associateFn, stateDir, userFilter, piSessions },
 ) {
   const candidates = adapter.enumerate({ cutoffMs, repo, config });
   const scanContext = adapter.createScanContext?.();
@@ -413,6 +470,7 @@ function discoverFiles(
       stats.skipped += 1;
       continue;
     }
+    if (adapter.name === "pi") piSessions.push(piSession(descriptor, null, candidate));
 
     const association = associateFn({
       cwd: descriptor.cwd,

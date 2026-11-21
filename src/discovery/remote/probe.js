@@ -92,6 +92,8 @@ async function descriptorFrom(adapter, row, id) {
       parentSessionId: row.parentSessionId,
       parentSessionPath: row.parentSessionPath,
       parentSessionStartedAt: row.parentSessionStartedAt,
+      /** A Pi header link, canonical on this host; discovery resolves it scan-wide. */
+      parentSession: row.parentSession,
       mtimeMs: row.mtimeMs || 0,
       bytes: row.bytes || 0,
       contentSignature,

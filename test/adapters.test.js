@@ -156,67 +156,53 @@ test("pi adapter reads the session header and drops thinking blocks", () => {
   assert.equal(toolCall.result, "nothing to commit");
 });
 
-test("pi adapter links a header-linked Pi child to its parent session", () => {
+test("pi adapter records a header-linked session's parent as a canonical path, never as automation", () => {
   const file = path.join(FIXTURES, "pi-child-session.jsonl");
   const child = pi.classify(candidateFor(file));
   assert.equal(child.id, "pi-child-5678");
-  assert.deepEqual(child.interactionSignals, {}, "a header link is ancestry, not automation");
-  assert.equal(child.parentSessionId, "pi-1234");
-  assert.equal(child.parentSessionPath, path.join(FIXTURES, "pi-session.jsonl"));
-  assert.equal(child.parentSessionStartedAt, Date.parse("2026-08-03T08:00:00.000Z"));
+  assert.equal(child.parentSession, fs.realpathSync(path.join(FIXTURES, "pi-session.jsonl")));
+  assert.deepEqual(child.interactionSignals, {}, "Pi's /fork writes parentSession too");
+  assert.equal(child.parentSessionId, undefined, "ancestry is resolved scan-wide, not per file");
   assert.equal(pi.read({ path: file }).model, "gpt-5.6-sol");
-  assert.notEqual(pi.cacheDependency(candidateFor(file)), undefined, "a child depends on its parent header");
-  assert.equal(pi.cacheDependency(candidateFor(path.join(FIXTURES, "pi-session.jsonl"))), undefined);
+  assert.equal(pi.classify(candidateFor(path.join(FIXTURES, "pi-session.jsonl"))).parentSession, undefined);
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-orphan-"));
+  const orphan = path.join(dir, "orphan.jsonl");
+  const header = { type: "session", version: 3, id: "orphan", cwd: "/repo/demo", parentSession: "gone.jsonl" };
+  fs.writeFileSync(orphan, `${JSON.stringify(header)}\n`);
+  assert.equal(pi.classify(candidateFor(orphan)).parentSession, path.join(fs.realpathSync(dir), "gone.jsonl"));
 });
 
-function writeLinkedPiSession(dir, name, extra = {}) {
-  const file = path.join(dir, `${name}.jsonl`);
-  fs.writeFileSync(file, `${JSON.stringify({ type: "session", version: 3, id: name, cwd: "/repo/demo", ...extra })}\n`);
-  return file;
-}
-
-test("pi adapter walks header-linked children to the highest readable ancestor", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-chain-"));
-  const lead = writeLinkedPiSession(dir, "lead", { timestamp: "2026-08-27T00:00:00.000Z" });
-  const child = writeLinkedPiSession(dir, "child", { parentSession: lead });
-  const grandchild = writeLinkedPiSession(dir, "grandchild", { parentSession: child });
-  const descriptor = pi.classify(candidateFor(grandchild));
-  assert.equal(descriptor.parentSessionId, "lead");
-  assert.equal(descriptor.parentSessionPath, lead);
-  assert.equal(descriptor.parentSessionStartedAt, Date.parse("2026-08-27T00:00:00.000Z"));
-});
-
-test("pi adapter gives every member of a parentSession cycle one observer", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-cycle-"));
-  const a = path.join(dir, "a.jsonl");
-  const b = writeLinkedPiSession(dir, "b", { parentSession: a });
-  writeLinkedPiSession(dir, "a", { parentSession: b });
-  const c = writeLinkedPiSession(dir, "c", { parentSession: b });
-  assert.equal(pi.classify(candidateFor(a)).parentSessionId, undefined, "the smallest path is the cycle's observer");
-  assert.equal(pi.classify(candidateFor(b)).parentSessionId, "a");
-  assert.equal(pi.classify(candidateFor(c)).parentSessionId, "a", "a tail into the cycle shares it too");
-});
-
-test("pi adapter marks a self-linked session's cache entry so old descriptors are reclassified", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-self-"));
-  const self = path.join(dir, "self.jsonl");
-  writeLinkedPiSession(dir, "self", { parentSession: self });
-  assert.notEqual(pi.cacheDependency(candidateFor(self)), undefined);
-  const descriptor = pi.classify(candidateFor(self));
-  assert.equal(descriptor.parentSessionId, undefined);
-  assert.deepEqual(descriptor.interactionSignals, {});
-});
-
-test("pi adapter keeps a header-linked child with a missing parent fail-soft", () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-orphan-"));
-  const file = writeLinkedPiSession(dir, "orphan", { parentSession: path.join(dir, "gone.jsonl") });
-  const descriptor = pi.classify(candidateFor(file));
-  assert.equal(descriptor.id, "orphan");
-  assert.deepEqual(descriptor.interactionSignals, {});
-  assert.equal(descriptor.parentSessionId, undefined);
-  assert.equal(descriptor.parentSessionPath, undefined);
-  assert.equal(descriptor.parentSessionStartedAt, undefined);
-  assert.notEqual(pi.cacheDependency(candidateFor(file)), undefined, "the parent may appear later");
+test("pi header reads stop at the first line and a warm cache check reads nothing", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-head-"));
+  const file = path.join(dir, "large.jsonl");
+  const header = { type: "session", version: 3, id: "large", cwd: "/repo/demo" };
+  const body = `${JSON.stringify({ type: "message", message: { role: "user", content: "x".repeat(1024) } })}\n`;
+  fs.writeFileSync(file, `${JSON.stringify(header)}\n${body.repeat(2048)}`);
+  const candidate = candidateFor(file);
+  const originalReadSync = fs.readSync;
+  const originalOpenSync = fs.openSync;
+  let bytes = 0;
+  let opens = 0;
+  fs.readSync = function (fd, buffer, ...args) {
+    const read = originalReadSync.call(this, fd, buffer, ...args);
+    bytes += read;
+    return read;
+  };
+  fs.openSync = function (...args) {
+    opens += 1;
+    return originalOpenSync.apply(this, args);
+  };
+  try {
+    pi.cacheDependency(candidate);
+    assert.equal(opens, 0, "the cache check must not open a plain Pi file");
+    assert.equal(pi.classify(candidate).id, "large");
+  } finally {
+    fs.readSync = originalReadSync;
+    fs.openSync = originalOpenSync;
+  }
+  assert.ok(candidate.bytes > 2_000_000);
+  assert.ok(bytes <= 4096, `read ${bytes} bytes for a one-line header`);
 });
 
 test("pi adapter ignores an omp-style model field outside a title-led transcript", () => {
@@ -454,7 +440,7 @@ test("pi adapter keeps plain Pi stores one level deep and reads nested layout on
           if (descriptor) {
             assert.deepEqual(descriptor.interactionSignals, {});
             assert.equal(descriptor.parentSessionId, undefined);
-            assert.equal(pi.cacheDependency(candidate), undefined);
+            assert.equal(pi.cacheDependency(candidate), String(pi.DESCRIPTOR_VERSION), "no other file is read");
           }
         }
       }

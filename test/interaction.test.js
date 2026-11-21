@@ -1128,6 +1128,17 @@ const piHeader = (id, cwd, extra = {}) => [
   { type: "session", version: 3, id, timestamp: "2026-08-27T00:00:00.000Z", cwd, ...extra },
 ];
 
+async function discoverPi(repo, env) {
+  return withPiEnv(env, async () => {
+    const config = loadConfig(repo, { discovery: { harnesses: ["pi"], since: "all" } });
+    config.state = new State(repo).ensure();
+    const repository = { name: "demo", root: repo, worktrees: [repo], remotes: [] };
+    return discoverTranscripts({ repo: repository, config });
+  });
+}
+
+const byNative = (result, nativeId) => result.transcripts.find((transcript) => transcript.nativeId === nativeId);
+
 test("a header-linked Pi fork stays interactive, shares its lead's observer, and reclassifies old cache", async () => {
   const repo = initRepo();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-discovery-"));
@@ -1139,30 +1150,31 @@ test("a header-linked Pi fork stays interactive, shares its lead's observer, and
   await withPiEnv({ HOME: home }, async () => {
     const config = loadConfig(repo, { discovery: { harnesses: ["pi"], since: "all" } });
     config.state = new State(repo).ensure();
-    // A cache written before parentSession was read: the fork looks like its own observer.
+    // Caches written by earlier versions: one without the link, one that marked the fork automated.
     const cache = config.state.readScanCache();
     for (const candidate of pi.enumerate({ config })) {
       const descriptor = pi.classify(candidate);
-      delete descriptor.parentSessionId;
-      delete descriptor.parentSessionPath;
-      delete descriptor.parentSessionStartedAt;
+      delete descriptor.parentSession;
+      if (descriptor.id === "fork-native") descriptor.interactionSignals = { source: "subagent" };
       cache.entries[`pi:${candidate.key}`] = { mtimeMs: candidate.mtimeMs, bytes: candidate.bytes, descriptor };
     }
     config.state.writeScanCache(cache);
 
     const repository = { name: "demo", root: repo, worktrees: [repo], remotes: [] };
     const first = await discoverTranscripts({ repo: repository, config });
-    assert.equal(first.perHarness.pi.cached, 1, "only the fork must be reclassified");
-    const lead = first.transcripts.find((transcript) => transcript.nativeId === "lead-native");
-    const fork = first.transcripts.find((transcript) => transcript.nativeId === "fork-native");
+    assert.equal(first.perHarness.pi.cached, 0, "descriptors from before the link are reclassified");
+    const lead = byNative(first, "lead-native");
+    const fork = byNative(first, "fork-native");
     assert.ok(lead && fork);
     assert.notEqual(lead.identity, fork.identity);
     assert.equal(fork.corroborationIdentity, lead.identity);
+    assert.equal(fork.parentSessionId, "lead-native");
     assert.equal(lead.interaction, INTERACTIVE);
     assert.equal(fork.interaction, INTERACTIVE, "parentSession is also written by a human /fork");
 
     const second = await discoverTranscripts({ repo: repository, config });
     assert.equal(second.perHarness.pi.cached, 2);
+    assert.equal(byNative(second, "fork-native").corroborationIdentity, lead.identity);
   });
 });
 
@@ -1177,17 +1189,74 @@ test("a Pi child naming its lead by real path shares the lead's observer through
   writeJsonl(leadRealPath, piHeader("lead-native", repo));
   writeJsonl(path.join(realStore, "child.jsonl"), piHeader("child-native", repo, { parentSession: leadRealPath }));
 
-  await withPiEnv({ HOME: home, PI_CODING_AGENT_SESSION_DIR: linkStore }, async () => {
-    const config = loadConfig(repo, { discovery: { harnesses: ["pi"], since: "all" } });
-    config.state = new State(repo).ensure();
-    const repository = { name: "demo", root: repo, worktrees: [repo], remotes: [] };
-    const { transcripts } = await discoverTranscripts({ repo: repository, config });
-    const lead = transcripts.find((transcript) => transcript.nativeId === "lead-native");
-    const child = transcripts.find((transcript) => transcript.nativeId === "child-native");
-    assert.ok(lead && child);
-    assert.equal(lead.path, path.join(linkStore, "lead.jsonl"), "discovered identities keep the store's spelling");
-    assert.equal(child.corroborationIdentity, lead.identity);
-  });
+  const result = await discoverPi(repo, { HOME: home, PI_CODING_AGENT_SESSION_DIR: linkStore });
+  const lead = byNative(result, "lead-native");
+  assert.equal(lead.path, path.join(linkStore, "lead.jsonl"), "discovered identities keep the store's spelling");
+  assert.equal(byNative(result, "child-native").corroborationIdentity, lead.identity);
+});
+
+test("a Pi fork in another cwd directory of a symlinked store shares its lead's observer", async () => {
+  const repo = initRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-fork-crossdir-"));
+  const realStore = path.join(home, "real-sessions");
+  fs.mkdirSync(path.join(home, ".pi", "agent"), { recursive: true });
+  fs.symlinkSync(realStore, path.join(home, ".pi", "agent", "sessions"));
+  const leadRealPath = path.join(realStore, "-repo-demo", "lead.jsonl");
+  writeJsonl(leadRealPath, piHeader("lead-native", repo));
+  writeJsonl(
+    path.join(realStore, "-repo-demo-packages-api", "fork.jsonl"),
+    piHeader("fork-native", path.join(repo, "packages"), { parentSession: fs.realpathSync(leadRealPath) }),
+  );
+
+  const result = await discoverPi(repo, { HOME: home });
+  const lead = byNative(result, "lead-native");
+  assert.ok(lead.path.startsWith(path.join(home, ".pi", "agent", "sessions")));
+  assert.equal(byNative(result, "fork-native").corroborationIdentity, lead.identity);
+});
+
+test("a warm Pi cache keeps one observer when the store is reached through another spelling", async () => {
+  const repo = initRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-cache-spelling-"));
+  const realStore = fs.realpathSync(fs.mkdtempSync(path.join(home, "real-")));
+  const linkStore = path.join(home, "store-link");
+  fs.symlinkSync(realStore, linkStore);
+  const leadPath = path.join(realStore, "lead.jsonl");
+  writeJsonl(leadPath, piHeader("lead-native", repo));
+  writeJsonl(path.join(realStore, "child.jsonl"), piHeader("child-native", repo, { parentSession: leadPath }));
+
+  for (const store of [realStore, linkStore]) {
+    const result = await discoverPi(repo, { HOME: home, PI_CODING_AGENT_SESSION_DIR: store });
+    const lead = byNative(result, "lead-native");
+    assert.equal(lead.path, path.join(store, "lead.jsonl"));
+    assert.equal(byNative(result, "child-native").corroborationIdentity, lead.identity, store);
+  }
+});
+
+test("Pi header chains resolve to the root, settle cycles on one observer, and fail soft", async () => {
+  const repo = initRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-chains-"));
+  const dir = path.join(home, ".pi", "agent", "sessions", "-repo-demo");
+  const at = (name) => path.join(dir, `${name}.jsonl`);
+  writeJsonl(at("lead"), piHeader("lead", repo));
+  writeJsonl(at("child"), piHeader("child", repo, { parentSession: at("lead") }));
+  writeJsonl(at("grandchild"), piHeader("grandchild", repo, { parentSession: at("child") }));
+  writeJsonl(at("a"), piHeader("a", repo, { parentSession: at("b") }));
+  writeJsonl(at("b"), piHeader("b", repo, { parentSession: at("a") }));
+  writeJsonl(at("tail"), piHeader("tail", repo, { parentSession: at("b") }));
+  writeJsonl(at("self"), piHeader("self", repo, { parentSession: at("self") }));
+  writeJsonl(at("orphan"), piHeader("orphan", repo, { parentSession: at("gone") }));
+
+  const result = await discoverPi(repo, { HOME: home });
+  const observer = (nativeId) => byNative(result, nativeId).corroborationIdentity;
+  assert.equal(observer("grandchild"), byNative(result, "lead").identity);
+  assert.equal(observer("child"), byNative(result, "lead").identity);
+  assert.equal(observer("a"), byNative(result, "a").identity, "the smallest id is the cycle's observer");
+  assert.equal(observer("b"), byNative(result, "a").identity);
+  assert.equal(observer("tail"), byNative(result, "a").identity);
+  assert.equal(observer("self"), byNative(result, "self").identity);
+  assert.equal(observer("orphan"), byNative(result, "orphan").identity);
+  assert.equal(byNative(result, "orphan").parentSessionId, undefined);
+  for (const transcript of result.transcripts) assert.equal(transcript.interaction, INTERACTIVE);
 });
 
 test("nested OMP subagents share the root identity once the root session appears", async () => {

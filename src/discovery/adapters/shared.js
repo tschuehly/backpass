@@ -8,13 +8,21 @@ export function readHeadLines(file, maxLines = 1, maxBytes = 512 * 1024) {
   try {
     fd = fs.openSync(file, "r");
     const size = fs.fstatSync(fd).size;
-    const length = Math.min(size, maxBytes);
-    const buffer = Buffer.alloc(length);
-    fs.readSync(fd, buffer, 0, length, 0);
-    const text = buffer.toString("utf8");
-    const lines = text.split("\n");
+    const limit = Math.min(size, maxBytes);
+    // Read in doubling chunks and stop once `maxLines` complete lines are in hand, so a
+    // header on line one never pulls a large session body (scans touch every file).
+    let buffer = Buffer.alloc(0);
+    while (buffer.length < limit) {
+      const chunk = Buffer.alloc(Math.min(Math.max(4096, buffer.length), limit - buffer.length));
+      const read = fs.readSync(fd, chunk, 0, chunk.length, buffer.length);
+      if (read <= 0) break;
+      buffer = Buffer.concat([buffer, chunk.subarray(0, read)]);
+      const complete = buffer.toString("utf8").split("\n").slice(0, -1);
+      if (complete.filter((l) => l.trim()).length >= maxLines) break;
+    }
+    const lines = buffer.toString("utf8").split("\n");
     // A final partial line is only safe to use when we read the whole file.
-    if (length < size) lines.pop();
+    if (buffer.length < size) lines.pop();
     return lines.filter((l) => l.trim()).slice(0, maxLines);
   } catch {
     return [];

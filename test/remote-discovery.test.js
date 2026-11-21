@@ -118,6 +118,35 @@ function assertSingletonObserver(transcripts, identity) {
   assert.equal(persisted.instructions[0].harmSessions, 1);
 }
 
+function writePiSession(file, id, cwd, extra = {}) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const header = { type: "session", version: 3, id, timestamp: "2026-08-27T00:00:00.000Z", cwd, ...extra };
+  fs.writeFileSync(file, `${JSON.stringify(header)}\n`);
+}
+
+test("a local copy of a remote Pi fork keeps the ancestry only the remote copy can resolve", async () => {
+  const s = scenario();
+  const remoteDir = path.join(s.remoteHome, ".pi", "agent", "sessions", "-code-demo");
+  const leadPath = path.join(remoteDir, "lead.jsonl");
+  writePiSession(leadPath, "lead-native", s.remoteClone);
+  writePiSession(path.join(remoteDir, "fork.jsonl"), "fork-native", s.remoteClone, { parentSession: leadPath });
+  // Only the fork was copied here; its header still names the lead's path on the remote.
+  const localFork = path.join(s.localHome, ".pi", "agent", "sessions", "-demo", "fork.jsonl");
+  writePiSession(localFork, "fork-native", s.repoRoot, { parentSession: leadPath });
+
+  const result = await withRemotePiEnv(s, () =>
+    discoverProject(s.repoRoot, { discovery: { hosts: ["mac-home"], harnesses: ["pi"], since: "all" } }),
+  );
+  assert.equal(result.perHost[0].duplicates, 1);
+  const lead = result.transcripts.find((transcript) => transcript.nativeId === "lead-native");
+  const fork = result.transcripts.find((transcript) => transcript.nativeId === "fork-native");
+  assert.equal(lead.host, "mac-home");
+  assert.equal(fork.host, null, "the local copy is the one kept");
+  assert.equal(fork.corroborationIdentity, lead.identity);
+  assert.equal(fork.interaction, INTERACTIVE, "ancestry never marks a fork automated");
+  assertSingletonObserver([lead, fork], lead.identity);
+});
+
 test("remote OMP subagents keep their parent's corroboration identity", async () => {
   const s = scenario();
   const sessionDir = path.join(s.remoteHome, ".omp", "agent", "sessions", "-repo-demo");
