@@ -1103,6 +1103,64 @@ test("standalone fold refreshes stale OMP interaction categories with unreadable
   }
 });
 
+test("flat Pi children share their lead's observer and reclassify a pre-relation cache", async () => {
+  const repo = initRepo();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-pi-child-discovery-"));
+  const sessionRoot = path.join(home, ".pi", "agent", "sessions", "-repo-demo");
+  const leadPath = path.join(sessionRoot, "lead.jsonl");
+  const childPath = path.join(sessionRoot, "child.jsonl");
+  const header = (id, extra = {}) => [
+    { type: "session", version: 3, id, timestamp: "2026-08-27T00:00:00.000Z", cwd: repo, ...extra },
+  ];
+  writeJsonl(leadPath, header("lead-native"));
+  writeJsonl(childPath, header("child-native", { parentSession: leadPath }));
+
+  const envKeys = [
+    "HOME",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
+    "BB_DATA_DIR",
+    "BB_PI_BRIDGE_SESSION_DIR",
+  ];
+  const prevEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+  for (const key of envKeys) delete process.env[key];
+  process.env.HOME = home;
+  try {
+    const config = loadConfig(repo, { discovery: { harnesses: ["pi"], since: "all" } });
+    config.state = new State(repo).ensure();
+    // A cache written before parentSession was read: the child looks like its own interactive observer.
+    const cache = config.state.readScanCache();
+    for (const candidate of pi.enumerate({ config })) {
+      const descriptor = pi.classify(candidate);
+      delete descriptor.parentSessionId;
+      delete descriptor.parentSessionPath;
+      delete descriptor.parentSessionStartedAt;
+      descriptor.interactionSignals = {};
+      cache.entries[`pi:${candidate.key}`] = { mtimeMs: candidate.mtimeMs, bytes: candidate.bytes, descriptor };
+    }
+    config.state.writeScanCache(cache);
+
+    const repository = { name: "demo", root: repo, worktrees: [repo], remotes: [] };
+    const first = await discoverTranscripts({ repo: repository, config });
+    assert.equal(first.perHarness.pi.cached, 1, "only the child must be reclassified");
+    const lead = first.transcripts.find((transcript) => transcript.nativeId === "lead-native");
+    const child = first.transcripts.find((transcript) => transcript.nativeId === "child-native");
+    assert.ok(lead && child);
+    assert.notEqual(lead.identity, child.identity);
+    assert.equal(child.corroborationIdentity, lead.identity);
+    assert.equal(lead.interaction, INTERACTIVE);
+    assert.equal(child.interaction, NON_INTERACTIVE);
+
+    const second = await discoverTranscripts({ repo: repository, config });
+    assert.equal(second.perHarness.pi.cached, 2);
+  } finally {
+    for (const [key, value] of Object.entries(prevEnv)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
 test("nested OMP subagents share the root identity once the root session appears", async () => {
   const repo = initRepo();
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "backpass-omp-nested-discovery-"));

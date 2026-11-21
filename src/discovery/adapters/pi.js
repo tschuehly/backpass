@@ -26,7 +26,10 @@ import {
  * `<escaped-cwd>/<session-id>/<Name>.jsonl`, and their own subagents at
  * `<escaped-cwd>/<session-id>/<Name>/<Name>.<Child>.jsonl`. Ancestor headers establish
  * observer provenance; nested layout alone marks automation. BB's Pi bridge writes the
- * same JSONL shape directly under `<bb-data-dir>/pi-bridge-sessions/`.
+ * same JSONL shape directly under `<bb-data-dir>/pi-bridge-sessions/`. Standard Pi child
+ * sessions (RPC `new_session { parentSession }`) stay flat beside their lead instead and
+ * name the parent's `.jsonl` path in the header's `parentSession`; that chain is walked to
+ * the highest readable ancestor, which then plays the same observer role as an omp root.
  *
  * Entries form a parent/child tree but arrive in order, so a linear read is faithful.
  * `model_change` / `thinking_level_change` records give the model actually used
@@ -172,6 +175,23 @@ function parentSessionPathFor(candidatePath) {
   return path.join(path.dirname(sessionDir), `${path.basename(sessionDir)}.jsonl`);
 }
 
+/** Header-linked ancestors, nearest first; stops at an unreadable or cyclic link. */
+function headerAncestorPaths(candidatePath, entry, scanContext) {
+  const out = [];
+  const seen = new Set([path.resolve(candidatePath)]);
+  let link = entry?.parentSession;
+  let from = candidatePath;
+  while (typeof link === "string" && link) {
+    const parentPath = path.resolve(path.dirname(from), link);
+    if (seen.has(parentPath)) break;
+    seen.add(parentPath);
+    out.push(parentPath);
+    link = readParentSession(parentPath, scanContext)?.entry?.parentSession;
+    from = parentPath;
+  }
+  return out;
+}
+
 function ancestorSessionPaths(candidatePath) {
   const out = [];
   let current = candidatePath;
@@ -187,13 +207,19 @@ export function cacheDependency(candidate, options = {}) {
   // Plain Pi files depend on nothing but themselves. An omp file also depends on its
   // ancestors, and carries a marker so a store first scanned without omp parsing
   // (a title-led header reads as null there) is reclassified once omp is switched on.
-  if (!candidate.omp) return undefined;
+  // A header-linked Pi child depends on its ancestor chain the same way.
+  const linked = candidate.subagent
+    ? []
+    : headerAncestorPaths(
+        candidate.path,
+        readSessionHeader(candidate.path, { omp: candidate.omp }),
+        options.scanContext,
+      );
+  if (!candidate.omp && !linked.length) return undefined;
   return JSON.stringify(
-    candidate.subagent
-      ? ancestorSessionPaths(candidate.path).map(
-          (ancestorPath) => readParentSession(ancestorPath, options.scanContext)?.fingerprint ?? null,
-        )
-      : [],
+    (candidate.subagent ? ancestorSessionPaths(candidate.path) : linked).map(
+      (ancestorPath) => readParentSession(ancestorPath, options.scanContext)?.fingerprint ?? null,
+    ),
   );
 }
 
@@ -210,10 +236,15 @@ export function classify(candidate, options = {}) {
     remotes: [],
     startedAt: entry.timestamp ? Date.parse(entry.timestamp) : candidate.mtimeMs,
     model: null,
-    interactionSignals: candidate.subagent ? { source: "subagent" } : emptyInteractionSignals(),
+    interactionSignals:
+      candidate.subagent || typeof entry.parentSession === "string"
+        ? { source: "subagent" }
+        : emptyInteractionSignals(),
   };
 
-  for (const ancestorPath of candidate.subagent ? ancestorSessionPaths(candidate.path) : []) {
+  for (const ancestorPath of candidate.subagent
+    ? ancestorSessionPaths(candidate.path)
+    : headerAncestorPaths(candidate.path, entry, scanContext)) {
     const ancestorInfo = readParentSession(ancestorPath, scanContext);
     const ancestor = ancestorInfo?.entry;
     if (!ancestor) continue;
